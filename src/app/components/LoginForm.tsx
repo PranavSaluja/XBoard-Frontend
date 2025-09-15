@@ -5,7 +5,7 @@ import { useState } from 'react';
 import axios from 'axios';
 import { Store, Mail, Lock, LogIn } from 'lucide-react';
 
-const API_BASE = 'https://xboard-backend-gexu.onrender.com/api';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:3001/api';
 
 interface LoginFormProps {
   onSuccess: (token: string) => void;

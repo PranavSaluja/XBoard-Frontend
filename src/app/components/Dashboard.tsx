@@ -1,12 +1,15 @@
 // frontend/xboard/app/components/Dashboard.tsx
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, BarChart, Bar, ResponsiveContainer } from 'recharts';
-import { Users, ShoppingCart, DollarSign, TrendingUp, Store, RefreshCw, LogOut, User } from 'lucide-react';
+import { 
+  Users, ShoppingCart, DollarSign, TrendingUp, Store, RefreshCw, 
+  LogOut, User, Webhook, Activity, CheckCircle, AlertCircle
+} from 'lucide-react';
 
-const API_BASE = 'https://xboard-backend-gexu.onrender.com/api';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:3001/api';
 
 interface DashboardProps {
   onLogout: () => void;
@@ -47,19 +50,33 @@ interface RecentOrder {
   created_at: string;
 }
 
+interface WebhookEvent {
+  id: number;
+  event_type: string;
+  shopify_id: string;
+  processed_at: string;
+}
+
+interface WebhookStatus {
+  webhooks_active: boolean;
+  last_webhook_event: string | null;
+  webhook_count: number;
+  events: WebhookEvent[];
+}
+
 export default function Dashboard({ onLogout }: DashboardProps) {
   const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [ordersByDate, setOrdersByDate] = useState<OrderByDate[]>([]);
   const [topCustomers, setTopCustomers] = useState<TopCustomer[]>([]);
   const [recentOrders, setRecentOrders] = useState<RecentOrder[]>([]);
+  const [webhookStatus, setWebhookStatus] = useState<WebhookStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-
-  useEffect(() => {
-    fetchAllData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const [refreshing, setRefreshing] = useState(false); // Used only for manual refresh
+  const [lastDashboardUpdate, setLastDashboardUpdate] = useState<Date>(new Date());
+  
+  const webhookSetupAttempted = useRef(false); // To prevent spamming setup requests
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null); // Ref to store interval ID
 
   const getAuthHeaders = () => {
     const token = localStorage.getItem('authToken');
@@ -70,17 +87,45 @@ export default function Dashboard({ onLogout }: DashboardProps) {
     };
   };
 
-  const fetchAllData = async () => {
+  // Automated Webhook Setup Function (purely for system use)
+  const setupWebhooksAutomatically = useCallback(async () => {
+    if (webhookSetupAttempted.current) {
+        console.log("Skipping auto-webhook setup attempt as one is already in progress or recently failed.");
+        return; 
+    }
+
+    webhookSetupAttempted.current = true; // Set flag
     try {
-      setLoading(true);
+      console.log("Attempting automatic webhook setup...");
+      await axios.post(`${API_BASE}/auth/setup-webhooks`, {}, getAuthHeaders());
+      // On success, immediately refetch all data to update status
+      await fetchAllData(true); 
+      console.log("Automatic webhook setup completed!");
+      // Reset flag to allow future attempts only if an issue occurs that changes webhookStatus
+      webhookSetupAttempted.current = false; // Allow new attempts if needed
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err)) {
+        console.error('Webhook setup failed (auto-attempt):', err.response?.data?.error || err.message);
+      } else {
+        console.error('Webhook setup failed (auto-attempt):', err);
+      }
+      // If it failed, don't spam. Wait a bit before allowing another auto-attempt.
+      setTimeout(() => webhookSetupAttempted.current = false, 30000); // Allow re-attempt after 30 seconds if it failed
+    }
+  }, []); 
+
+
+  const fetchAllData = useCallback(async (silent = false) => {
+    try {
+      if (!silent) setLoading(true);
       
-      // Fetch user info, which includes their associated shop_domain
-      const [userRes, overviewRes, ordersDateRes, topCustomersRes, recentOrdersRes] = await Promise.all([
+      const [userRes, overviewRes, ordersDateRes, topCustomersRes, recentOrdersRes, webhookRes] = await Promise.all([
         axios.get(`${API_BASE}/me`, getAuthHeaders()),
         axios.get(`${API_BASE}/overview`, getAuthHeaders()),
         axios.get(`${API_BASE}/orders-by-date`, getAuthHeaders()),
         axios.get(`${API_BASE}/top-customers`, getAuthHeaders()),
-        axios.get(`${API_BASE}/recent-orders?limit=5`, getAuthHeaders())
+        axios.get(`${API_BASE}/recent-orders?limit=10`, getAuthHeaders()),
+        axios.get(`${API_BASE}/webhook-status`, getAuthHeaders()).catch(() => ({ data: null }))
       ]);
 
       setUserInfo(userRes.data);
@@ -88,12 +133,20 @@ export default function Dashboard({ onLogout }: DashboardProps) {
       setOrdersByDate(ordersDateRes.data);
       setTopCustomers(topCustomersRes.data);
       setRecentOrders(recentOrdersRes.data);
+      setWebhookStatus(webhookRes.data);
+      setLastDashboardUpdate(new Date()); // Update timestamp on successful data fetch
+
+      // If webhooks are NOT active, automatically attempt to set them up in the background
+      // This is now guarded by webhookSetupAttempted ref
+      if (webhookRes.data && !webhookRes.data.webhooks_active && !webhookSetupAttempted.current) {
+          setupWebhooksAutomatically(); 
+      }
+
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
         console.error('Failed to fetch data (axios error):', err.response?.data?.error || err.message);
         const status = err.response?.status;
         if (status === 401 || status === 403) {
-          // Token expired or invalid, log out
           onLogout();
         }
       } else {
@@ -101,29 +154,52 @@ export default function Dashboard({ onLogout }: DashboardProps) {
         console.error('Failed to fetch data:', error);
       }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  };
+  }, [onLogout, setupWebhooksAutomatically]);
 
-  const handleRefresh = async () => {
+
+  // Effect for initial data fetch and setting up polling
+  useEffect(() => {
+    // Clear any existing interval to prevent duplicates
+    if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+    }
+
+    // Initial data fetch
+    fetchAllData(); 
+
+    // Set up polling
+    pollingIntervalRef.current = setInterval(() => {
+        console.log("Polling for dashboard updates...");
+        fetchAllData(true); // Call silent fetch
+    }, 15000); // Polling every 15 seconds for faster updates
+
+    // Cleanup function to clear interval on component unmount
+    return () => {
+      if (pollingIntervalRef.current) {
+          clearInterval(pollingIntervalRef.current);
+      }
+    };
+  }, [fetchAllData]); // Only fetchAllData as dependency
+
+
+  const handleManualRefresh = async () => {
     setRefreshing(true);
     try {
-      // Step 1: Trigger the backend to sync data from Shopify for this tenant
       await axios.post(`${API_BASE}/sync`, {}, getAuthHeaders()); 
-      
-      // Step 2: After the backend sync, fetch the latest dashboard data from our DB
-      await fetchAllData(); 
-      console.log("Dashboard refreshed and synced!");
+      await fetchAllData(); // Fetches latest data after sync
+      console.log("Dashboard manually refreshed and synced!");
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
-        console.error('Refresh/Sync failed (axios error):', err.response?.data?.error || err.message);
-        // If the sync itself fails (e.g., Shopify token expired), you might want to logout
-        if (err.response?.status === 401 || err.response?.status === 403) {
+        console.error('Manual Refresh/Sync failed:', err.response?.data?.error || err.message);
+        const status = err.response?.status;
+        if (status === 401 || status === 403) {
             onLogout();
         }
       } else {
         const error = err instanceof Error ? err : new Error(String(err));
-        console.error('Refresh/Sync failed:', error);
+        console.error('Manual Refresh/Sync failed:', error);
       }
     } finally {
       setRefreshing(false);
@@ -140,7 +216,7 @@ export default function Dashboard({ onLogout }: DashboardProps) {
 
   const avgOrderValue = overview && Number(overview.total_orders) > 0 
     ? Math.round(Number(overview.total_revenue) / Number(overview.total_orders)) 
-    : 0; // Handle division by zero
+    : 0;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -154,24 +230,32 @@ export default function Dashboard({ onLogout }: DashboardProps) {
               </div>
               <div>
                 <h1 className="text-2xl font-bold text-gray-900">XBoard</h1>
-                <p className="text-sm text-gray-500">Your Shopify Analytics Dashboard</p>
+                <p className="text-sm text-gray-500">Your Shopify Analytics</p>
               </div>
             </div>
             
             {/* User Info & Controls */}
             <div className="flex items-center space-x-4">
+              {/* Live Sync Status (simplified) */}
+              <div className="flex items-center space-x-2 bg-gray-50 rounded-lg px-3 py-2">
+                <div className={`w-2 h-2 rounded-full ${webhookStatus?.webhooks_active ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}></div>
+                <span className="text-xs text-gray-600">
+                  {webhookStatus?.webhooks_active ? 'Live Sync Active' : 'Initializing Sync'}
+                </span>
+              </div>
+
               <div className="flex items-center space-x-2 bg-gray-50 rounded-lg px-3 py-2">
                 <User className="w-4 h-4 text-gray-600" />
                 <span className="text-sm text-gray-700">{userInfo?.email}</span>
               </div>
               
               <button
-                onClick={handleRefresh}
+                onClick={handleManualRefresh}
                 disabled={refreshing}
                 className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
               >
                 <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
-                <span>Refresh</span>
+                <span>Refresh Data</span>
               </button>
               
               <button
@@ -187,7 +271,7 @@ export default function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8">
-        {/* Store Info Banner */}
+        {/* Store Info Banner with Automated Status */}
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
           <div className="flex items-center justify-between">
             <div>
@@ -197,14 +281,46 @@ export default function Dashboard({ onLogout }: DashboardProps) {
               <p className="text-blue-700 text-sm">
                 Status: {userInfo?.status} • Connected since: {new Date(userInfo?.installed_at || '').toLocaleDateString()}
               </p>
+              <p className="text-blue-600 text-xs mt-1">
+                Last dashboard update: {lastDashboardUpdate.toLocaleTimeString()}
+              </p>
             </div>
-            <div className="text-sm text-blue-600 bg-blue-100 px-3 py-1 rounded-full">
-              🔒 Private Dashboard
+            
+            {/* Webhook Status Display (Automated, subtle) */}
+            <div className="text-right flex items-center space-x-2">
+                <Webhook className="w-4 h-4 text-blue-600" />
+                {webhookStatus?.webhooks_active ? (
+                    <span className="text-green-700 text-sm font-medium">Real-time Webhooks Active</span>
+                ) : (
+                    <span className="text-amber-700 text-sm font-medium">Webhooks Initializing...</span>
+                )}
             </div>
           </div>
         </div>
 
-        {/* Overview Cards */}
+        {/* Webhook Activity Indicator (only show if webhooks are active) */}
+        {webhookStatus?.events && webhookStatus.events.length > 0 && webhookStatus.webhooks_active && (
+          <div className="bg-green-50 border border-green-200 rounded-lg p-3 mb-6">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <Activity className="w-4 h-4 text-green-600" />
+                <span className="text-green-800 text-sm font-medium">Recent Real-time Activity</span>
+              </div>
+              <div className="text-green-700 text-xs">
+                {webhookStatus.webhook_count} events processed
+              </div>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {webhookStatus.events.slice(0, 3).map((event) => (
+                <span key={event.id} className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded-full">
+                  {event.event_type} • {new Date(event.processed_at).toLocaleTimeString()}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Overview Cards (same as before) */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
           <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100">
             <div className="flex items-center justify-between">
@@ -259,9 +375,8 @@ export default function Dashboard({ onLogout }: DashboardProps) {
           </div>
         </div>
 
-        {/* Charts Grid */}
+        {/* Charts Grid (same as before) */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-          {/* Daily Revenue Chart */}
           <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100">
             <h3 className="text-lg font-semibold text-gray-900 mb-4">📈 Daily Revenue Trend</h3>
             <ResponsiveContainer width="100%" height={300}>
@@ -275,7 +390,6 @@ export default function Dashboard({ onLogout }: DashboardProps) {
             </ResponsiveContainer>
           </div>
 
-          {/* Top Customers Chart */}
           <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100">
             <h3 className="text-lg font-semibold text-gray-900 mb-4">👥 Top Customers by Spend</h3>
             <ResponsiveContainer width="100%" height={300}>
@@ -290,10 +404,16 @@ export default function Dashboard({ onLogout }: DashboardProps) {
           </div>
         </div>
 
-        {/* Recent Orders Table */}
+        {/* Recent Orders Table (enhanced with real-time indicator) */}
         <div className="bg-white rounded-xl shadow-sm border border-gray-100">
-          <div className="px-6 py-4 border-b border-gray-100">
+          <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
             <h3 className="text-lg font-semibold text-gray-900">🛒 Recent Orders</h3>
+            {webhookStatus?.webhooks_active && ( // Only show live updates if webhooks are active
+              <div className="flex items-center space-x-2 text-sm text-green-600">
+                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                <span>Live Updates</span>
+              </div>
+            )}
           </div>
           <div className="overflow-x-auto">
             <table className="w-full">
@@ -321,10 +441,18 @@ export default function Dashboard({ onLogout }: DashboardProps) {
                     </td>
                   </tr>
                 ) : (
-                  recentOrders.map((order) => (
-                    <tr key={order.id} className="hover:bg-gray-50">
+                  recentOrders.map((order, index) => (
+                    <tr 
+                      key={order.id} 
+                      className={`hover:bg-gray-50 ${index < 3 ? 'bg-blue-50/30' : ''}`}
+                    >
                       <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
                         #{order.shopify_order_id}
+                        {index < 3 && (
+                          <span className="ml-2 text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded-full">
+                            New
+                          </span>
+                        )}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                         {order.currency === 'USD' ? '$' : '₹'}{order.total_price}
